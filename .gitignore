@@ -2,3 +2,5 @@
 planet.local.json
 *.tif
 *.pth
+/Results
+/__pycache__
