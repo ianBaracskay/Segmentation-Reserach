@@ -722,6 +722,7 @@ elif cfg.use_dino:
             enable_diag = False
 
         if enable_diag:
+            diagnostics_start = perf_counter()
             print("[INFO] Generating DINO diagnostic visualizations...")
 
             # 1. Per-prompt breakdown - separate visualization for each detector
@@ -766,6 +767,8 @@ elif cfg.use_dino:
                     print(f"[ERROR] Box size distribution visualization failed: {e}")
                     import traceback
                     traceback.print_exc()
+
+            log_stage("DINO diagnostics complete", diagnostics_start)
 
     if cfg.dino_only:
         finish_pipeline_early("DINO-only mode enabled; skipping SAM and CLIP stages.")
