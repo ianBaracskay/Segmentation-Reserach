@@ -39,16 +39,22 @@ def resolve_device(device_setting: str) -> str:
     return device_setting
 
 
-def build_sam_predictor(config, image: np.ndarray) -> tuple[SamPredictor, str]:
+def load_sam_model(config):
     device = resolve_device(config.sam_device)
     ensure_checkpoint(config.sam_checkpoint, config.sam_checkpoint_url)
 
     print(f"[INFO] Loading SAM model '{config.sam_model_type}' on device '{device}'")
     sam = sam_model_registry[config.sam_model_type](checkpoint=config.sam_checkpoint)
     sam.to(device=device)
+    return sam, device
+
+
+def build_sam_predictor(config, image: np.ndarray | None = None) -> tuple[SamPredictor, str]:
+    sam, device = load_sam_model(config)
 
     predictor = SamPredictor(sam)
-    predictor.set_image(image)
+    if image is not None:
+        predictor.set_image(image)
     return predictor, device
 
 
@@ -86,11 +92,15 @@ def generate_sam_masks_from_detections(
     predictor: SamPredictor,
     detections: list[dict],
     config=None,
+    tile_origin: tuple[int, int] = (0, 0),
+    full_shape: tuple[int, int] | None = None,
 ) -> list[dict]:
     masks: list[dict] = []
     print("[INFO] Running SAM refinement on DINO boxes")
 
     img_h, img_w = predictor.original_size
+    origin_y, origin_x = tile_origin
+    target_full_shape = full_shape if full_shape is not None else (img_h, img_w)
 
     # Optional prompt-aware seed expansion before SAM refinement.
     expand_factor_by_prompt = {}
@@ -121,12 +131,25 @@ def generate_sam_masks_from_detections(
                 box=np.array([x1, y1, x2, y2]),
                 multimask_output=False,
             )
+            full_seg = sam_masks[0]
+
+            ys, xs = np.where(full_seg)
+            if ys.size == 0 or xs.size == 0:
+                print(f"[WARN] SAM produced empty mask on box {i}; skipping")
+                continue
+
+            my0, my1 = int(ys.min()), int(ys.max()) + 1
+            mx0, mx1 = int(xs.min()), int(xs.max()) + 1
+            local_seg = full_seg[my0:my1, mx0:mx1]
+
             masks.append(
                 {
-                    "segmentation": sam_masks[0],
+                    "segmentation": local_seg,
+                    "tile_bounds": (my0 + origin_y, my1 + origin_y, mx0 + origin_x, mx1 + origin_x),
+                    "full_shape": target_full_shape,
                     "predicted_iou": float(scores[0]),
                     "stability_score": float(scores[0]),
-                    "bbox": [x1, y1, x2 - x1, y2 - y1],
+                    "bbox": [x1 + origin_x, y1 + origin_y, x2 - x1, y2 - y1],
                     "dino_phrase": phrase,
                     "dino_prompt_group": prompt_group,
                     "dino_score": float(rec["score"]),
@@ -145,7 +168,13 @@ def generate_sam_masks_from_detections(
     return masks
 
 
-def generate_sam_masks_automatic(sam_model, config, image: np.ndarray) -> list[dict]:
+def generate_sam_masks_automatic(
+    sam_model,
+    config,
+    image: np.ndarray,
+    tile_origin: tuple[int, int] = (0, 0),
+    full_shape: tuple[int, int] | None = None,
+) -> list[dict]:
     """Generate SAM masks automatically without DINO detections using point-prompt grid."""
     print("[INFO] Running SAM automatic mask generation (no DINO)")
     
@@ -159,17 +188,26 @@ def generate_sam_masks_automatic(sam_model, config, image: np.ndarray) -> list[d
     auto_masks = mask_generator.generate(image)
     
     masks: list[dict] = []
+    origin_y, origin_x = tile_origin
+    target_full_shape = full_shape if full_shape is not None else image.shape[:2]
     for i, mask_dict in enumerate(auto_masks):
         masks.append(
             {
                 "segmentation": mask_dict["segmentation"],
                 "predicted_iou": float(mask_dict.get("predicted_iou", 0.0)),
                 "stability_score": float(mask_dict.get("stability_score", 0.0)),
-                "bbox": mask_dict["bbox"],
+                "bbox": [
+                    int(mask_dict["bbox"][0] + origin_x),
+                    int(mask_dict["bbox"][1] + origin_y),
+                    int(mask_dict["bbox"][2]),
+                    int(mask_dict["bbox"][3]),
+                ],
                 "dino_phrase": "auto-generated",
                 "dino_prompt_group": "auto",
                 "dino_score": 1.0,  # No DINO score for auto-generated masks
                 "area": mask_dict.get("area", 0),
+                "tile_bounds": (origin_y, origin_y + image.shape[0], origin_x, origin_x + image.shape[1]),
+                "full_shape": target_full_shape,
             }
         )
     
@@ -177,7 +215,13 @@ def generate_sam_masks_automatic(sam_model, config, image: np.ndarray) -> list[d
     return masks
 
 
-def generate_sam_masks_automatic_tiled(sam_model, config, image: np.ndarray) -> list[dict]:
+def generate_sam_masks_automatic_tiled(
+    sam_model,
+    config,
+    image: np.ndarray,
+    tile_origin: tuple[int, int] = (0, 0),
+    full_shape: tuple[int, int] | None = None,
+) -> list[dict]:
     """Run automatic SAM per tile to avoid large-memory failures on huge rasters."""
     h, w = image.shape[:2]
     tile_size = int(getattr(config, "sam_auto_tile_size_px", 1400))
@@ -195,6 +239,8 @@ def generate_sam_masks_automatic_tiled(sam_model, config, image: np.ndarray) -> 
     )
 
     masks: list[dict] = []
+    origin_y, origin_x = tile_origin
+    target_full_shape = full_shape if full_shape is not None else (h, w)
     for tile_idx, (y0, y1, x0, x1) in enumerate(tile_coords, start=1):
         tile_img = image[y0:y1, x0:x1]
         tile_h, tile_w = tile_img.shape[:2]
@@ -225,13 +271,13 @@ def generate_sam_masks_automatic_tiled(sam_model, config, image: np.ndarray) -> 
                     "segmentation": seg,
                     "predicted_iou": float(mask_dict.get("predicted_iou", 0.0)),
                     "stability_score": float(mask_dict.get("stability_score", 0.0)),
-                    "bbox": [int(bx + x0), int(by + y0), int(bw), int(bh)],
+                    "bbox": [int(bx + x0 + origin_x), int(by + y0 + origin_y), int(bw), int(bh)],
                     "dino_phrase": "auto-generated",
                     "dino_prompt_group": "auto",
                     "dino_score": 1.0,
                     "area": int(mask_dict.get("area", int(seg.sum()))),
-                    "tile_bounds": (y0, y1, x0, x1),
-                    "full_shape": (h, w),
+                    "tile_bounds": (y0 + origin_y, y1 + origin_y, x0 + origin_x, x1 + origin_x),
+                    "full_shape": target_full_shape,
                 }
             )
 

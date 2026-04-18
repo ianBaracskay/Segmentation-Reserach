@@ -1,7 +1,17 @@
 from pathlib import Path
 
 # Input image settings
-tif_file = "Maps/NYC/NYC(small).tif"
+tif_files = [
+    "Maps/NYC/NYC(small).tif",
+    "Maps/GTCampus/CampusFullSize.tif",
+    "Maps/Grove(LA)/The Grove.tif"
+
+]
+# Use "all" to run every file in tif_files, or "single" to run just one selection.
+tif_run_mode = "single"  # "all" or "single"
+tif_single_index = 1  # 0-based index into tif_files when tif_run_mode="single"
+tif_single_file = None  # Optional explicit single file path override when tif_run_mode="single"
+tif_file = tif_files[tif_single_index]  # Backward compatibility for modules still reading cfg.tif_file
 use_bbox_crop = False
 bbox_lonlat = (-84.4010, 33.7720, -84.3950, 33.7760)
 
@@ -13,10 +23,21 @@ dino_visualization_backend = "pil"  # "matplotlib" or "pil" - PIL is faster, sma
 
 # Heatmap settings
 amenity_grid_cell_area_m2 = 256.0
-amenity_heatmap_excluded_prompts = ["building_roof"]
+amenity_heatmap_excluded_prompts = ["building_roof", "warehouse_roof"]
 amenity_heatmap_taper_sigma_cells = 0.90
 amenity_heatmap_taper_blend = 0.75
 dino_heatmap_mode = "average"  # "average" or "sum" - average shows per-pixel detection confidence, sum shows detection density
+dino_enable_diagnostic_visualizations = True
+dino_diagnostic_max_pixels = 120_000_000  # Skip heavy DINO diagnostics above this image size
+
+# Large-image tiled pipeline settings
+large_image_tile_max_pixels = 120_000_000  # Switch to tiled DINO+SAM processing above this size
+large_image_tile_size_px = 4096
+large_image_tile_overlap_px = 384
+
+# Caching settings - saves DINO and SAM results to disk to avoid re-computation on error recovery
+enable_pipeline_caching = True  # Set to True to cache DINO/SAM intermediate results between runs
+overwrite_pipeline_cache = False  # Set to True to force re-compute and overwrite existing cache
 
 # DINO settings - Set use_dino=False to skip DINO and use SAM's automatic mask generation instead
 use_dino = True
@@ -44,7 +65,18 @@ dino_refine_bounds_min_area_ratio = 0.80  # Accept refinements only when they sh
 # Each prompt gets its own DINO run, then all detections are merged before SAM.
 from prompts import AVAILABLE_PROMPTS
 
-ACTIVE_PROMPTS = ["sports_court", "park", "building_roof"]  # ORDERED: sports_court first, then park, then building_roof
+ACTIVE_PROMPTS = [
+    "sports_court",
+    "outdoor_seating",
+    "standing_gathering",
+    #"transit_hub",
+    #"pedestrian_features",
+    "sidewalk_surface",
+    "road_surface",
+    "park",
+    #"warehouse_roof",
+    #"building_roof",
+]  # ORDERED: gathering-focused classes first, then broad land-use and roof classes
 
 # Auto-build dino_prompt_configs from selected prompts
 dino_prompt_configs = [

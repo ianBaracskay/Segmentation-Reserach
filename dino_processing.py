@@ -1,4 +1,5 @@
 from pathlib import Path
+from time import perf_counter
 
 import groundingdino
 import groundingdino.datasets.transforms as T
@@ -363,11 +364,14 @@ def run_dino_prompts(
     dino_device: str,
     pixels_per_meter_sq: float | None = None,
     return_unfiltered: bool = False,
+    show_timing_summary: bool = True,
 ) -> list[dict] | tuple[list[dict], list[dict], list[dict]]:
     print("[INFO] Running prompt-by-prompt DINO detection")
+    dino_total_start = perf_counter()
     all_records: list[dict] = []
     all_unfiltered_records: list[dict] = []
     all_filtered_records: list[dict] = []
+    prompt_timing_rows: list[dict] = []
     validate_split_boxes = bool(getattr(config, "dino_validate_split_boxes", True))
     validate_split_max_candidates = int(getattr(config, "dino_validate_split_max_candidates", 120))
     enable_area_split = bool(getattr(config, "dino_enable_area_split", True))
@@ -627,6 +631,7 @@ def run_dino_prompts(
         return geom_filtered
 
     for cfg in config.dino_prompt_configs:
+        prompt_start = perf_counter()
         # Negative-first pass: detect forbidden categories and remove overlapping positive boxes.
         negative_dino_boxes: list[np.ndarray] = []
         negative_dino_caption = str(cfg.get("negative_dino_caption", "")).strip()
@@ -888,6 +893,30 @@ def run_dino_prompts(
 
         print(f"[INFO] DINO [{cfg['name']}] kept for SAM: {len(prompt_records)}")
         all_records.extend(prompt_records)
+        prompt_elapsed_s = perf_counter() - prompt_start
+        prompt_timing_rows.append(
+            {
+                "name": str(cfg["name"]),
+                "seconds": float(prompt_elapsed_s),
+                "kept_for_sam": int(len(prompt_records)),
+            }
+        )
+        print(f"[TIMING] DINO [{cfg['name']}] total time: {prompt_elapsed_s:.2f}s")
+
+    if show_timing_summary and prompt_timing_rows:
+        total_elapsed_s = perf_counter() - dino_total_start
+        print("[TIMING] DINO prompt timing summary (sorted by runtime):")
+        for idx, row in enumerate(
+            sorted(prompt_timing_rows, key=lambda r: r["seconds"], reverse=True), start=1
+        ):
+            print(
+                f"[TIMING] {idx:02d}. {row['name']:<24} {row['seconds']:>7.2f}s "
+                f"(kept_for_sam={row['kept_for_sam']})"
+            )
+        print(
+            f"[TIMING] DINO total runtime: {total_elapsed_s:.2f}s "
+            f"across {len(prompt_timing_rows)} prompts"
+        )
 
     if return_unfiltered:
         return all_records, all_unfiltered_records, all_filtered_records
@@ -938,7 +967,12 @@ def save_dino_detection_viz(
     dino_group_colors = {
         "sidewalk": "lime",
         "sitting": "orange",
+        "transit_hub": "magenta",
+        "pedestrian_features": "chartreuse",
+        "sidewalk_surface": "cyan",
+        "road_surface": "gray",
         "building_roof": "lime",
+        "warehouse_roof": "orange",
         "outdoor_seating": "lime",
         "seated_dining": "orange",
         "standing_gathering": "cyan",

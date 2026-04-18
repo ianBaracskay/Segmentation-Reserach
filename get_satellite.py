@@ -1,5 +1,7 @@
 from datetime import datetime
+import os
 from pathlib import Path
+import subprocess
 import sys
 from time import perf_counter
 import warnings
@@ -14,7 +16,7 @@ import open_clip
 import torch
 from matplotlib.colors import rgb_to_hsv
 from PIL import Image
-from segment_anything import sam_model_registry
+from segment_anything import SamPredictor, sam_model_registry
 
 import config as cfg
 
@@ -59,6 +61,7 @@ if getattr(cfg, "dino_suppress_low_risk_warnings", False):
 
 from dino_processing import (
     build_dino_model_and_transform,
+    iter_tile_coords,
     run_dino_prompts,
     save_dino_detection_viz,
     save_dino_detection_viz_pil,
@@ -84,6 +87,7 @@ from sam_processing import (
     generate_sam_masks_from_detections,
     generate_sam_masks_automatic,
     generate_sam_masks_automatic_tiled,
+    load_sam_model,
     ensure_checkpoint,
 )
 
@@ -91,7 +95,117 @@ from sam_processing import (
 script_start = perf_counter()
 log_stage("Starting satellite sidewalk segmentation pipeline")
 
-run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def _progress_bar(current: int, total: int, width: int = 24) -> str:
+    total_safe = max(1, int(total))
+    current_clamped = min(max(0, int(current)), total_safe)
+    filled = int(round((current_clamped / total_safe) * width))
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+
+batch_index_env = os.environ.get("SEGMENTATION_BATCH_INDEX")
+batch_total_env = os.environ.get("SEGMENTATION_BATCH_TOTAL")
+batch_index = int(batch_index_env) if batch_index_env and batch_index_env.isdigit() else 1
+batch_total = int(batch_total_env) if batch_total_env and batch_total_env.isdigit() else 1
+
+
+def log_image_stage(stage_name: str, stage_idx: int | None = None, stage_total: int | None = None) -> None:
+    if stage_idx is None or stage_total is None:
+        print(
+            f"[PROGRESS] [Image {batch_index}/{batch_total}] "
+            f"{_progress_bar(batch_index, batch_total)} {stage_name}"
+        )
+        return
+
+    print(
+        f"[PROGRESS] [Image {batch_index}/{batch_total}] "
+        f"{_progress_bar(batch_index, batch_total)} "
+        f"[Stage {stage_idx}/{stage_total}] {stage_name}"
+    )
+
+override_tif_file = os.environ.get("SEGMENTATION_TIF_FILE")
+if override_tif_file:
+    active_tif_file = override_tif_file
+else:
+    configured_tif_files = getattr(cfg, "tif_files", None)
+    if configured_tif_files is None:
+        configured_tif_files = cfg.tif_file
+
+    if isinstance(configured_tif_files, (str, Path)):
+        tif_files = [str(configured_tif_files)]
+    else:
+        tif_files = [str(p) for p in configured_tif_files]
+
+    if not tif_files:
+        raise RuntimeError("No tif files configured. Set cfg.tif_files or cfg.tif_file.")
+
+    tif_run_mode = str(getattr(cfg, "tif_run_mode", "all")).strip().lower()
+    if tif_run_mode not in {"all", "single"}:
+        raise RuntimeError("Invalid cfg.tif_run_mode. Expected 'all' or 'single'.")
+
+    if tif_run_mode == "single":
+        selected_tif_file = getattr(cfg, "tif_single_file", None)
+        if not selected_tif_file:
+            legacy_tif_file = getattr(cfg, "tif_file", None)
+            if isinstance(legacy_tif_file, (str, Path)):
+                selected_tif_file = str(legacy_tif_file)
+
+        if selected_tif_file:
+            tif_files = [str(selected_tif_file)]
+        else:
+            tif_single_index = int(getattr(cfg, "tif_single_index", 0))
+            if tif_single_index < 0 or tif_single_index >= len(tif_files):
+                raise RuntimeError(
+                    f"cfg.tif_single_index={tif_single_index} is out of range for "
+                    f"{len(tif_files)} configured files"
+                )
+            tif_files = [tif_files[tif_single_index]]
+
+        print(f"[INFO] Single-image mode enabled: {tif_files[0]}")
+
+    if len(tif_files) > 1:
+        print(f"[INFO] Running batch pipeline on {len(tif_files)} images")
+        print(f"[INFO] Batch progress: {_progress_bar(0, len(tif_files))} 0/{len(tif_files)} complete")
+        failures: list[tuple[str, int]] = []
+        successes = 0
+        for idx, tif_path in enumerate(tif_files, start=1):
+            print(f"[INFO] [{idx}/{len(tif_files)}] Starting image: {tif_path}")
+            env = os.environ.copy()
+            env["SEGMENTATION_TIF_FILE"] = tif_path
+            env["SEGMENTATION_BATCH_INDEX"] = str(idx)
+            env["SEGMENTATION_BATCH_TOTAL"] = str(len(tif_files))
+            result = subprocess.run([sys.executable, __file__], env=env)
+            if result.returncode != 0:
+                failures.append((tif_path, int(result.returncode)))
+                print(
+                    f"[WARN] [{idx}/{len(tif_files)}] Failed image: {tif_path} "
+                    f"(exit code {result.returncode}); skipping and continuing"
+                )
+            else:
+                successes += 1
+                print(f"[INFO] [{idx}/{len(tif_files)}] Completed image: {tif_path}")
+
+            remaining = len(tif_files) - idx
+            print(
+                f"[INFO] Batch progress: {_progress_bar(idx, len(tif_files))} "
+                f"{idx}/{len(tif_files)} complete, {remaining} remaining"
+            )
+
+        if failures:
+            print("[WARN] Batch run finished with failures:")
+            for tif_path, code in failures:
+                print(f"[WARN] - {tif_path} (exit code {code})")
+
+        print(
+            f"[INFO] Batch run summary: {successes} succeeded, "
+            f"{len(failures)} failed, {len(tif_files)} total"
+        )
+        # Return success if at least one image completed; this preserves successful outputs.
+        sys.exit(0 if successes > 0 else 1)
+
+    active_tif_file = tif_files[0]
+
+run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{Path(active_tif_file).stem}"
 cfg.results_dir.mkdir(parents=True, exist_ok=True)
 print(f"[INFO] Saving output figures to: {cfg.results_dir.resolve()}")
 saved_figure_paths: list[Path] = []
@@ -119,6 +233,239 @@ def save_current_figure(filename: str, category: str, dpi: int | None = None, pi
         print(f"[INFO] Saved figure: {output_path}")
 
 
+def log_pipeline_error(context: str, exc: Exception) -> None:
+    print(f"[ERROR] {context}: {exc}", flush=True)
+    import traceback
+    traceback.print_exc()
+
+
+import pickle
+
+def get_cache_dir() -> Path:
+    """Return cache directory, creating it if needed."""
+    cache_dir = cfg.results_dir / ".segmentation_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_cache_key_for_image_dino(image_path: str, image_hash: str) -> str:
+    """Generate cache key for full-image DINO results."""
+    stem = Path(image_path).stem
+    return f"{stem}_hash{image_hash}_dino_full.pkl"
+
+
+def get_cache_key_for_image_masks(image_path: str, image_hash: str) -> str:
+    """Generate cache key for full-image SAM masks."""
+    stem = Path(image_path).stem
+    return f"{stem}_hash{image_hash}_masks_full.pkl"
+
+
+def get_cache_key_for_tile_dino(image_path: str, image_hash: str, tile_idx: int, tile_count: int) -> str:
+    """Generate cache key for tiled DINO results."""
+    stem = Path(image_path).stem
+    return f"{stem}_hash{image_hash}_tile{tile_idx}-of-{tile_count}_dino.pkl"
+
+
+def get_cache_key_for_tile_masks(image_path: str, image_hash: str, tile_idx: int, tile_count: int) -> str:
+    """Generate cache key for tiled SAM masks."""
+    stem = Path(image_path).stem
+    return f"{stem}_hash{image_hash}_tile{tile_idx}-of-{tile_count}_masks.pkl"
+
+
+def compute_image_hash(img_array: np.ndarray) -> str:
+    """Compute a quick hash of image array to detect if image changed."""
+    import hashlib
+    # Only hash shape and first/last pixel values to keep it fast
+    hash_input = f"{img_array.shape}_{img_array.dtype}_{img_array[0,0].tobytes()}_{img_array[-1,-1].tobytes()}"
+    return hashlib.md5(hash_input.encode()).hexdigest()[:8]
+
+
+def save_dino_cache(image_path: str, image_hash: str, dino_records: list | None, file_context: str) -> bool:
+    """Save DINO results to cache. Returns True if saved, False otherwise."""
+    if not bool(getattr(cfg, "enable_pipeline_caching", True)):
+        return False
+    if dino_records is None:
+        return False
+    
+    try:
+        cache_dir = get_cache_dir()
+        cache_file = cache_dir / file_context
+        with open(cache_file, "wb") as f:
+            pickle.dump({"dino_records": dino_records}, f)
+        print(f"[INFO] Cached DINO results: {cache_file.name}")
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed to save DINO cache: {e}")
+        return False
+
+
+def load_dino_cache(image_path: str, image_hash: str, file_context: str) -> list | None:
+    """Load DINO results from cache. Returns None if not found or caching disabled."""
+    if not bool(getattr(cfg, "enable_pipeline_caching", True)):
+        return None
+    if bool(getattr(cfg, "overwrite_pipeline_cache", False)):
+        return None
+    
+    try:
+        cache_dir = get_cache_dir()
+        cache_file = cache_dir / file_context
+        if not cache_file.exists():
+            return None
+        
+        with open(cache_file, "rb") as f:
+            data = pickle.load(f)
+        print(f"[INFO] Loaded DINO from cache: {cache_file.name}")
+        return data.get("dino_records")
+    except Exception as e:
+        print(f"[WARN] Failed to load DINO cache: {e}")
+        return None
+
+
+def save_masks_cache(image_path: str, image_hash: str, masks: list | None, file_context: str) -> bool:
+    """Save SAM masks to cache. Returns True if saved, False otherwise."""
+    if not bool(getattr(cfg, "enable_pipeline_caching", True)):
+        return False
+    if masks is None or not masks:
+        return False
+    
+    try:
+        cache_dir = get_cache_dir()
+        cache_file = cache_dir / file_context
+        with open(cache_file, "wb") as f:
+            pickle.dump({"masks": masks}, f)
+        print(f"[INFO] Cached {len(masks)} SAM masks: {cache_file.name}")
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed to save masks cache: {e}")
+        return False
+
+
+def load_masks_cache(image_path: str, image_hash: str, file_context: str) -> list | None:
+    """Load SAM masks from cache. Returns None if not found or caching disabled."""
+    if not bool(getattr(cfg, "enable_pipeline_caching", True)):
+        return None
+    if bool(getattr(cfg, "overwrite_pipeline_cache", False)):
+        return None
+    
+    try:
+        cache_dir = get_cache_dir()
+        cache_file = cache_dir / file_context
+        if not cache_file.exists():
+            return None
+        
+        with open(cache_file, "rb") as f:
+            data = pickle.load(f)
+        masks = data.get("masks")
+        print(f"[INFO] Loaded {len(masks) if masks else 0} masks from cache: {cache_file.name}")
+        return masks
+    except Exception as e:
+        print(f"[WARN] Failed to load masks cache: {e}")
+        return None
+
+
+def process_large_tile(
+    tile_idx: int,
+    tile_coords: list[tuple[int, int, int, int]],
+    img_model: np.ndarray,
+    image_path: str,
+    image_hash: str,
+    cfg,
+    dino_model,
+    dino_transform,
+    dino_device: str,
+    sam_model,
+    sam_predictor,
+    pixels_per_meter_sq: float | None,
+) -> list[dict]:
+    y0, y1, x0, x1 = tile_coords[tile_idx - 1]
+    tile_img_model = img_model[y0:y1, x0:x1]
+    if tile_img_model.size == 0:
+        return []
+
+    print(
+        f"[INFO] [Tile {tile_idx}/{len(tile_coords)}] "
+        f"Processing pixels y={y0}:{y1}, x={x0}:{x1}"
+    )
+
+    # Try loading DINO from cache first
+    cache_key_dino = get_cache_key_for_tile_dino(image_path, image_hash, tile_idx, len(tile_coords))
+    cached_dino = load_dino_cache(image_path, image_hash, cache_key_dino)
+    
+    tile_dino_records: list[dict] = []
+    if cached_dino is not None:
+        tile_dino_records = cached_dino
+        print(f"[INFO] [Tile {tile_idx}/{len(tile_coords)}] Using cached DINO results ({len(tile_dino_records)} boxes)")
+    else:
+        try:
+            tile_dino_records, _, _ = run_dino_prompts(
+                tile_img_model,
+                cfg,
+                dino_model,
+                dino_transform,
+                dino_device,
+                pixels_per_meter_sq,
+                return_unfiltered=True,
+                show_timing_summary=False,
+            )
+            save_dino_cache(image_path, image_hash, tile_dino_records, cache_key_dino)
+        except Exception as exc:
+            log_pipeline_error(f"[Tile {tile_idx}/{len(tile_coords)}] DINO failed", exc)
+            print(f"[INFO] [Tile {tile_idx}/{len(tile_coords)}] Retrying with automatic SAM instead")
+
+    if tile_dino_records:
+        # Try loading SAM masks from cache
+        cache_key_masks = get_cache_key_for_tile_masks(image_path, image_hash, tile_idx, len(tile_coords))
+        cached_masks = load_masks_cache(image_path, image_hash, cache_key_masks)
+        
+        if cached_masks is not None:
+            print(f"[INFO] [Tile {tile_idx}/{len(tile_coords)}] Using cached SAM masks ({len(cached_masks)} masks)")
+            return cached_masks
+        
+        try:
+            sam_predictor.set_image(tile_img_model)
+            tile_masks = generate_sam_masks_from_detections(
+                sam_predictor,
+                tile_dino_records,
+                cfg,
+                tile_origin=(y0, x0),
+                full_shape=img_model.shape[:2],
+            )
+            save_masks_cache(image_path, image_hash, tile_masks, cache_key_masks)
+            return tile_masks
+        except Exception as exc:
+            log_pipeline_error(f"[Tile {tile_idx}/{len(tile_coords)}] SAM refinement failed", exc)
+            print(f"[INFO] [Tile {tile_idx}/{len(tile_coords)}] Falling back to automatic SAM on the tile")
+
+    try:
+        tile_masks = generate_sam_masks_automatic_tiled(
+            sam_model,
+            cfg,
+            tile_img_model,
+            tile_origin=(y0, x0),
+            full_shape=img_model.shape[:2],
+        )
+        save_masks_cache(image_path, image_hash, tile_masks, get_cache_key_for_tile_masks(image_path, image_hash, tile_idx, len(tile_coords)))
+        return tile_masks
+    except Exception as exc:
+        log_pipeline_error(f"[Tile {tile_idx}/{len(tile_coords)}] Automatic SAM failed", exc)
+        print(f"[INFO] [Tile {tile_idx}/{len(tile_coords)}] Final fallback: automatic SAM on whole tile")
+
+    try:
+        tile_masks = generate_sam_masks_automatic(
+            sam_model,
+            cfg,
+            tile_img_model,
+            tile_origin=(y0, x0),
+            full_shape=img_model.shape[:2],
+        )
+        save_masks_cache(image_path, image_hash, tile_masks, get_cache_key_for_tile_masks(image_path, image_hash, tile_idx, len(tile_coords)))
+        return tile_masks
+    except Exception as exc:
+        log_pipeline_error(f"[Tile {tile_idx}/{len(tile_coords)}] All tile methods failed", exc)
+        print(f"[ERROR] [Tile {tile_idx}/{len(tile_coords)}] No method worked; skipping tile")
+        return []
+
+
 def finish_pipeline_early(reason: str) -> None:
     print(f"[INFO] {reason}")
     print(f"[INFO] Total figures saved this run: {len(saved_figure_paths)}")
@@ -138,10 +485,14 @@ def expand_mask_to_full_image(mask_dict: dict) -> np.ndarray:
     return full_seg
 
 
-report_geotiff_spatial_info(cfg.tif_file, use_crop=cfg.use_bbox_crop, lonlat_bbox=cfg.bbox_lonlat)
+PIPELINE_STAGE_TOTAL = 6
+log_image_stage(f"Preparing image '{Path(active_tif_file).name}'", 1, PIPELINE_STAGE_TOTAL)
 
-img_raw = load_rgb_image(cfg.tif_file, use_crop=cfg.use_bbox_crop, lonlat_bbox=cfg.bbox_lonlat)
-loaded_extent_m = get_loaded_extent_meters(cfg.tif_file, use_crop=cfg.use_bbox_crop, lonlat_bbox=cfg.bbox_lonlat)
+preprocessing_start = perf_counter()
+report_geotiff_spatial_info(active_tif_file, use_crop=cfg.use_bbox_crop, lonlat_bbox=cfg.bbox_lonlat)
+
+img_raw = load_rgb_image(active_tif_file, use_crop=cfg.use_bbox_crop, lonlat_bbox=cfg.bbox_lonlat)
+loaded_extent_m = get_loaded_extent_meters(active_tif_file, use_crop=cfg.use_bbox_crop, lonlat_bbox=cfg.bbox_lonlat)
 
 if loaded_extent_m is None:
     print("[WARN] Could not estimate loaded image extent in meters; amenity heatmap will be skipped.")
@@ -175,20 +526,81 @@ print(
 
 # Save input image using PIL to avoid matplotlib memory issues with large arrays
 from PIL import Image
-input_image_filename = f"{Path(cfg.tif_file).stem}_input_image.png"
+input_image_filename = f"{Path(active_tif_file).stem}_input_image.png"
 input_image_out = cfg.results_dir / "input_images" / input_image_filename
 input_image_out.parent.mkdir(parents=True, exist_ok=True)
 img_pil = Image.fromarray(img_display, mode="RGB")
 img_pil.save(str(input_image_out))
 saved_figure_paths.append(input_image_out)
 print(f"[INFO] Saved figure: {input_image_out}")
+log_stage("Image preprocessing complete", preprocessing_start)
+
+# Compute image hash for cache keying
+image_hash = compute_image_hash(img_model)
+print(f"[INFO] Image hash for caching: {image_hash}")
 
 # Conditional DINO + SAM or automatic SAM
 stage_start = perf_counter()
 if cfg.dino_only and not cfg.use_dino:
     raise RuntimeError("dino_only=True requires use_dino=True")
 
-if cfg.use_dino:
+pixels_per_meter_sq = None
+if loaded_extent_m is not None:
+    img_h, img_w = img_model.shape[:2]
+    extent_w_m, extent_h_m = loaded_extent_m
+    pixels_per_meter_sq = (img_w / extent_w_m) * (img_h / extent_h_m)
+
+image_pixels = int(img_model.shape[0] * img_model.shape[1])
+large_image_tile_limit = int(getattr(cfg, "large_image_tile_max_pixels", 120_000_000))
+large_image_tile_mode = bool(cfg.use_dino and image_pixels > large_image_tile_limit)
+
+if large_image_tile_mode:
+    if cfg.dino_only:
+        raise RuntimeError("dino_only=True is not supported in large-image tiled mode.")
+
+    print(
+        "[INFO] Large image detected; running tiled DINO+SAM pipeline "
+        f"({image_pixels:,} px > {large_image_tile_limit:,} limit)"
+    )
+    tile_size = int(getattr(cfg, "large_image_tile_size_px", 4096))
+    tile_overlap = int(getattr(cfg, "large_image_tile_overlap_px", 384))
+    tile_coords = iter_tile_coords(img_model.shape[0], img_model.shape[1], tile_size, tile_overlap)
+    print(
+        f"[INFO] Tiled pipeline using {len(tile_coords)} tiles "
+        f"(tile={tile_size}, overlap={tile_overlap})"
+    )
+
+    dino_model, dino_transform, dino_device = build_dino_model_and_transform(cfg)
+    sam_model, sam_device = load_sam_model(cfg)
+    sam_predictor = SamPredictor(sam_model)
+    masks = []
+
+    for tile_idx, (y0, y1, x0, x1) in enumerate(tile_coords, start=1):
+        try:
+            tile_masks = process_large_tile(
+                tile_idx,
+                tile_coords,
+                img_model,
+                active_tif_file,
+                image_hash,
+                cfg,
+                dino_model,
+                dino_transform,
+                dino_device,
+                sam_model,
+                sam_predictor,
+                pixels_per_meter_sq,
+            )
+            masks.extend(tile_masks)
+        except Exception as exc:
+            log_pipeline_error(f"[Tile {tile_idx}/{len(tile_coords)}] Unhandled tile failure", exc)
+            print(f"[ERROR] [Tile {tile_idx}/{len(tile_coords)}] Skipping tile after failure")
+
+    if not masks:
+        print("[ERROR] Tiled large-image pipeline produced no masks after all fallbacks.")
+
+elif cfg.use_dino:
+    log_image_stage("Running DINO detection", 2, PIPELINE_STAGE_TOTAL)
     print("[INFO] Running Grounding DINO detection")
     dino_model, dino_transform, dino_device = build_dino_model_and_transform(cfg)
     dino_run_id = f"{run_id}_dino_only" if cfg.dino_only else run_id
@@ -197,30 +609,38 @@ if cfg.use_dino:
         print("[INFO] DINO-only mode active: DINO outputs will be labeled with '_dino_only'.")
     
     # Calculate pixels-to-meters conversion for real-world area checking
-    pixels_per_meter_sq = None
-    if loaded_extent_m is not None:
-        img_h, img_w = img_model.shape[:2]
-        extent_w_m, extent_h_m = loaded_extent_m
-        pixels_per_meter_sq = (img_w / extent_w_m) * (img_h / extent_h_m)
+    if pixels_per_meter_sq is not None:
         print(f"[INFO] Pixel-to-meters: {pixels_per_meter_sq:.6f} px²/m²")
     
-    print("[DEBUG] About to call run_dino_prompts", flush=True)
-    try:
-        dino_records, dino_unfiltered_records, dino_filtered_records = run_dino_prompts(
-            img_model,
-            cfg,
-            dino_model,
-            dino_transform,
-            dino_device,
-            pixels_per_meter_sq,
-            return_unfiltered=True,
-        )
-        print(f"[DEBUG] run_dino_prompts returned: {len(dino_records) if dino_records else 0} kept, {len(dino_unfiltered_records) if dino_unfiltered_records else 0} unfiltered", flush=True)
-    except Exception as e:
-        print(f"[ERROR] run_dino_prompts failed: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    # Try loading DINO from cache first
+    cache_key_dino_full = get_cache_key_for_image_dino(active_tif_file, image_hash)
+    cached_dino_records = load_dino_cache(active_tif_file, image_hash, cache_key_dino_full)
+    
+    if cached_dino_records is not None:
+        print(f"[INFO] Using cached DINO results ({len(cached_dino_records)} boxes)")
+        dino_records = cached_dino_records
+        dino_unfiltered_records = []
+        dino_filtered_records = []
+    else:
+        print("[DEBUG] About to call run_dino_prompts", flush=True)
+        try:
+            dino_records, dino_unfiltered_records, dino_filtered_records = run_dino_prompts(
+                img_model,
+                cfg,
+                dino_model,
+                dino_transform,
+                dino_device,
+                pixels_per_meter_sq,
+                return_unfiltered=True,
+                show_timing_summary=True,
+            )
+            save_dino_cache(active_tif_file, image_hash, dino_records, cache_key_dino_full)
+            print(f"[DEBUG] run_dino_prompts returned: {len(dino_records) if dino_records else 0} kept, {len(dino_unfiltered_records) if dino_unfiltered_records else 0} unfiltered", flush=True)
+        except Exception as e:
+            print(f"[ERROR] run_dino_prompts failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
 
     if dino_records:
         print(f"[INFO] Grounding DINO total kept detections: {len(dino_records)}")
@@ -287,52 +707,65 @@ if cfg.use_dino:
                     dpi=DINO_SAVE_DPI,
                 )
 
-    # Generate diagnostic visualizations for DINO detections
+    # Generate diagnostic visualizations for DINO detections.
+    # For very large rasters, skip heavy diagnostics to avoid memory exhaustion.
     if dino_records or dino_unfiltered_records:
-        print("[INFO] Generating DINO diagnostic visualizations...")
-        
-        # 1. Per-prompt breakdown - separate visualization for each detector
-        if dino_records:
-            try:
-                save_per_prompt_breakdown(img_display, dino_records, dino_run_id, config=cfg)
-            except Exception as e:
-                print(f"[ERROR] Per-prompt breakdown visualization failed: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # 2. Filtering stage comparison - show stages from unfiltered to passed to filtered-out
-        if dino_unfiltered_records:
-            try:
-                save_filtering_stage_comparison(
-                    img_display, 
-                    dino_unfiltered_records, 
-                    dino_records,
-                    dino_filtered_records, 
-                    dino_run_id, 
-                    config=cfg
-                )
-            except Exception as e:
-                print(f"[ERROR] Filtering stage comparison visualization failed: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # 3. Detection heatmap - confidence density map
-        if dino_records:
-            try:
-                save_detection_heatmap(img_display, dino_records, dino_run_id, config=cfg)
-            except Exception as e:
-                print(f"[ERROR] Detection heatmap visualization failed: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # 4. Box size distribution - analysis of detected object sizes
-        if dino_records:
-            try:
-                save_box_size_distribution(img_display, dino_records, dino_run_id, config=cfg)
-            except Exception as e:
-                print(f"[ERROR] Box size distribution visualization failed: {e}")
-                import traceback
-                traceback.print_exc()
+        max_diag_pixels = int(getattr(cfg, "dino_diagnostic_max_pixels", 120_000_000))
+        enable_diag = bool(getattr(cfg, "dino_enable_diagnostic_visualizations", True))
+        image_pixels = int(img_display.shape[0] * img_display.shape[1])
+
+        if enable_diag and image_pixels > max_diag_pixels:
+            print(
+                "[INFO] Skipping heavy DINO diagnostics for large image "
+                f"({image_pixels:,} px > {max_diag_pixels:,} limit)"
+            )
+            enable_diag = False
+
+        if enable_diag:
+            print("[INFO] Generating DINO diagnostic visualizations...")
+
+            # 1. Per-prompt breakdown - separate visualization for each detector
+            if dino_records:
+                try:
+                    save_per_prompt_breakdown(img_display, dino_records, dino_run_id, config=cfg)
+                except Exception as e:
+                    print(f"[ERROR] Per-prompt breakdown visualization failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # 2. Filtering stage comparison - show stages from unfiltered to passed to filtered-out
+            if dino_unfiltered_records:
+                try:
+                    save_filtering_stage_comparison(
+                        img_display,
+                        dino_unfiltered_records,
+                        dino_records,
+                        dino_filtered_records,
+                        dino_run_id,
+                        config=cfg
+                    )
+                except Exception as e:
+                    print(f"[ERROR] Filtering stage comparison visualization failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # 3. Detection heatmap - confidence density map
+            if dino_records:
+                try:
+                    save_detection_heatmap(img_display, dino_records, dino_run_id, config=cfg)
+                except Exception as e:
+                    print(f"[ERROR] Detection heatmap visualization failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # 4. Box size distribution - analysis of detected object sizes
+            if dino_records:
+                try:
+                    save_box_size_distribution(img_display, dino_records, dino_run_id, config=cfg)
+                except Exception as e:
+                    print(f"[ERROR] Box size distribution visualization failed: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     if cfg.dino_only:
         finish_pipeline_early("DINO-only mode enabled; skipping SAM and CLIP stages.")
@@ -340,39 +773,113 @@ if cfg.use_dino:
     if not dino_records:
         print("[WARN] Grounding DINO produced no valid detections after filtering. Running tiled automatic SAM fallback.")
         from sam_processing import resolve_device
+        log_image_stage("Running SAM fallback auto-generation", 3, PIPELINE_STAGE_TOTAL)
 
         device = resolve_device(cfg.sam_device)
-        ensure_checkpoint(cfg.sam_checkpoint, cfg.sam_checkpoint_url)
-        print(f"[INFO] Loading SAM model '{cfg.sam_model_type}' on device '{device}'")
-        sam = sam_model_registry[cfg.sam_model_type](checkpoint=cfg.sam_checkpoint)
-        sam.to(device=device)
+        
+        # Try loading masks from cache
+        cache_key_masks_full = get_cache_key_for_image_masks(active_tif_file, image_hash)
+        cached_masks = load_masks_cache(active_tif_file, image_hash, cache_key_masks_full)
+        if cached_masks is not None:
+            print(f"[INFO] Using cached SAM masks ({len(cached_masks)} masks)")
+            masks = cached_masks
+        else:
+            ensure_checkpoint(cfg.sam_checkpoint, cfg.sam_checkpoint_url)
+            print(f"[INFO] Loading SAM model '{cfg.sam_model_type}' on device '{device}'")
+            sam = sam_model_registry[cfg.sam_model_type](checkpoint=cfg.sam_checkpoint)
+            sam.to(device=device)
 
-        log_stage("SAM model ready", stage_start)
-        masks = generate_sam_masks_automatic_tiled(sam, cfg, img_model)
+            log_stage("SAM model ready", stage_start)
+            try:
+                masks = generate_sam_masks_automatic_tiled(sam, cfg, img_model)
+                save_masks_cache(active_tif_file, image_hash, masks, cache_key_masks_full)
+            except Exception as exc:
+                log_pipeline_error("Automatic SAM tiled fallback failed", exc)
+                print("[INFO] Retrying with non-tiled automatic SAM")
+                try:
+                    masks = generate_sam_masks_automatic(sam, cfg, img_model)
+                    save_masks_cache(active_tif_file, image_hash, masks, cache_key_masks_full)
+                except Exception as retry_exc:
+                    log_pipeline_error("Automatic SAM retry failed", retry_exc)
+                    print("[ERROR] No SAM fallback method worked for this image")
+                    masks = []
         sam_device = device
     else:
         print(f"[INFO] Grounding DINO total kept detections for SAM: {len(dino_records)}")
 
-        predictor, sam_device = build_sam_predictor(cfg, img_model)
-        log_stage("SAM model ready", stage_start)
-        masks = generate_sam_masks_from_detections(predictor, dino_records, cfg)
+        log_image_stage("Running SAM refinement", 3, PIPELINE_STAGE_TOTAL)
+        
+        # Try loading masks from cache
+        cache_key_masks_full = get_cache_key_for_image_masks(active_tif_file, image_hash)
+        cached_masks = load_masks_cache(active_tif_file, image_hash, cache_key_masks_full)
+        if cached_masks is not None:
+            print(f"[INFO] Using cached SAM masks ({len(cached_masks)} masks)")
+            masks = cached_masks
+            from sam_processing import resolve_device
+            sam_device = resolve_device(cfg.sam_device)
+        else:
+            predictor, sam_device = build_sam_predictor(cfg, img_model)
+            log_stage("SAM model ready", stage_start)
+            try:
+                masks = generate_sam_masks_from_detections(predictor, dino_records, cfg)
+                save_masks_cache(active_tif_file, image_hash, masks, cache_key_masks_full)
+            except Exception as exc:
+                log_pipeline_error("SAM refinement from DINO failed", exc)
+                print("[INFO] Retrying with automatic SAM fallback")
+                sam_fallback = sam_model_registry[cfg.sam_model_type](checkpoint=cfg.sam_checkpoint)
+                sam_fallback.to(device=sam_device)
+                try:
+                    masks = generate_sam_masks_automatic_tiled(sam_fallback, cfg, img_model)
+                    save_masks_cache(active_tif_file, image_hash, masks, cache_key_masks_full)
+                except Exception as retry_exc:
+                    log_pipeline_error("Automatic SAM fallback after DINO-SAM failure failed", retry_exc)
+                    print("[INFO] Retrying with non-tiled automatic SAM")
+                    try:
+                        masks = generate_sam_masks_automatic(sam_fallback, cfg, img_model)
+                        save_masks_cache(active_tif_file, image_hash, masks, cache_key_masks_full)
+                    except Exception as final_exc:
+                        log_pipeline_error("Final automatic SAM fallback failed", final_exc)
+                        print("[ERROR] No SAM method worked after DINO-SAM failure")
+                        masks = []
 else:
+    log_image_stage("Running SAM auto-generation", 3, PIPELINE_STAGE_TOTAL)
     print("[INFO] Skipping DINO and using automatic SAM mask generation")
     from sam_processing import resolve_device
     
     device = resolve_device(cfg.sam_device)
-    ensure_checkpoint(cfg.sam_checkpoint, cfg.sam_checkpoint_url)
-    print(f"[INFO] Loading SAM model '{cfg.sam_model_type}' on device '{device}'")
-    sam = sam_model_registry[cfg.sam_model_type](checkpoint=cfg.sam_checkpoint)
-    sam.to(device=device)
     
-    log_stage("SAM model ready", stage_start)
-    masks = generate_sam_masks_automatic_tiled(sam, cfg, img_model)
+    # Try loading masks from cache
+    cache_key_masks_full = get_cache_key_for_image_masks(active_tif_file, image_hash)
+    cached_masks = load_masks_cache(active_tif_file, image_hash, cache_key_masks_full)
+    if cached_masks is not None:
+        print(f"[INFO] Using cached SAM masks ({len(cached_masks)} masks)")
+        masks = cached_masks
+    else:
+        ensure_checkpoint(cfg.sam_checkpoint, cfg.sam_checkpoint_url)
+        print(f"[INFO] Loading SAM model '{cfg.sam_model_type}' on device '{device}'")
+        sam = sam_model_registry[cfg.sam_model_type](checkpoint=cfg.sam_checkpoint)
+        sam.to(device=device)
+        
+        log_stage("SAM model ready", stage_start)
+        try:
+            masks = generate_sam_masks_automatic_tiled(sam, cfg, img_model)
+            save_masks_cache(active_tif_file, image_hash, masks, cache_key_masks_full)
+        except Exception as exc:
+            log_pipeline_error("Automatic SAM tiled generation failed", exc)
+            print("[INFO] Retrying with non-tiled automatic SAM")
+            try:
+                masks = generate_sam_masks_automatic(sam, cfg, img_model)
+                save_masks_cache(active_tif_file, image_hash, masks, cache_key_masks_full)
+            except Exception as retry_exc:
+                log_pipeline_error("Automatic SAM retry failed", retry_exc)
+                print("[ERROR] No SAM method worked for this image")
+                masks = []
     sam_device = device
 
 if not masks:
-    print("[WARN] No masks were produced for selected prompts. Continuing with empty overlays and heatmap.")
+    print("[ERROR] No masks were produced for selected prompts after all fallbacks.")
 
+log_image_stage("Running CLIP scoring", 4, PIPELINE_STAGE_TOTAL)
 clip_device = sam_device if sam_device in ("cpu", "cuda") else ("cuda" if torch.cuda.is_available() else "cpu")
 
 stage_start = perf_counter()
@@ -440,18 +947,14 @@ for prompt_config in cfg.dino_prompt_configs:
 log_stage("Text prompt encoding complete", stage_start)
 
 
-def score_mask(
-    mask_dict: dict,
-    pos_text_feature: torch.Tensor,
-    neg_text_feature: torch.Tensor | None,
-    prompt_config: dict,
-) -> float:
+def _extract_mask_geometry(mask_dict: dict) -> tuple | None:
+    """Extract geometric coordinates and area safely from a mask dict. Returns None if invalid."""
     tile_seg = mask_dict["segmentation"]
     tile_bounds = mask_dict.get("tile_bounds")
 
     ys, xs = np.where(tile_seg)
     if ys.size == 0 or xs.size == 0:
-        return -1.0
+        return None
 
     ly0, ly1 = int(ys.min()), int(ys.max()) + 1
     lx0, lx1 = int(xs.min()), int(xs.max()) + 1
@@ -466,11 +969,32 @@ def score_mask(
         iy0, iy1, ix0, ix1 = ly0, ly1, lx0, lx1
 
     area_ratio = float(tile_seg.sum()) / float(full_h * full_w)
+    h = max(1, iy1 - iy0)
+    w = max(1, ix1 - ix0)
+    bbox_fill = float(tile_seg.sum()) / float(h * w)
+
+    return (iy0, iy1, ix0, ix1, ly0, ly1, lx0, lx1, h, w, area_ratio, bbox_fill, full_h, full_w)
+
+
+def score_mask(
+    mask_dict: dict,
+    pos_text_feature: torch.Tensor,
+    neg_text_feature: torch.Tensor | None,
+    prompt_config: dict,
+) -> float:
+    """Score one mask with CLIP plus lightweight geometry and color heuristics."""
+    geom = _extract_mask_geometry(mask_dict)
+    if geom is None:
+        return -1.0
+
+    iy0, iy1, ix0, ix1, ly0, ly1, lx0, lx1, h, w, area_ratio, bbox_fill, _, _ = geom
+
     min_area = prompt_config.get("clip_min_area_ratio", 0.00015)
     max_area = prompt_config.get("clip_max_area_ratio", 0.25)
     if area_ratio < min_area or area_ratio > max_area:
         return -1.0
 
+    tile_seg = mask_dict["segmentation"]
     crop = img_model[iy0:iy1, ix0:ix1]
     crop_mask = tile_seg[ly0:ly1, lx0:lx1][..., None]
     object_only = np.where(crop_mask, crop, 255).astype(np.uint8)
@@ -493,15 +1017,11 @@ def score_mask(
         stability = float(mask_dict.get("stability_score", 0.0))
         score += 0.05 * iou + 0.05 * stability
 
-    h = max(1, iy1 - iy0)
-    w = max(1, ix1 - ix0)
     aspect = max(h, w) / float(min(h, w))
-    bbox_fill = float(tile_seg.sum()) / float(h * w)
-
+    bbox_fill_score = np.clip((0.65 - bbox_fill) / 0.65, 0.0, 1.0)
     elongation_score = np.clip((aspect - 1.5) / 6.0, 0.0, 1.0)
-    sparse_fill_score = np.clip((0.65 - bbox_fill) / 0.65, 0.0, 1.0)
     score += 0.12 * float(elongation_score)
-    score += 0.06 * float(sparse_fill_score)
+    score += 0.06 * float(bbox_fill_score)
 
     mask_pixels = img_model[iy0:iy1, ix0:ix1][tile_seg[ly0:ly1, lx0:lx1]]
     if mask_pixels.size > 0:
@@ -513,21 +1033,128 @@ def score_mask(
         max_sat = prompt_config.get("max_saturation", 0.28)
         min_val = prompt_config.get("min_value", 0.35)
 
-        low_sat_score = np.clip(
-            (max_sat - sat) / max_sat,
-            0.0,
-            1.0,
-        )
-        bright_enough_score = np.clip(
-            (val - min_val) / (1.0 - min_val),
-            0.0,
-            1.0,
-        )
+        low_sat_score = np.clip((max_sat - sat) / max_sat, 0.0, 1.0)
+        bright_enough_score = np.clip((val - min_val) / (1.0 - min_val), 0.0, 1.0)
 
         score += 0.05 * float(low_sat_score)
         score += 0.04 * float(bright_enough_score)
 
     return score
+
+
+def batch_score_masks_clip(
+    masks_input: list,
+    pos_text_feature: torch.Tensor,
+    neg_text_feature: torch.Tensor | None,
+    prompt_config: dict,
+) -> list[float]:
+    """Batch-score masks using vectorized CLIP encoding. ~2-4x faster than serial."""
+    scores = [0.0] * len(masks_input)
+    
+    # First pass: quick geometric filtering and crop preparation
+    min_area = prompt_config.get("clip_min_area_ratio", 0.00015)
+    max_area = prompt_config.get("clip_max_area_ratio", 0.25)
+    
+    candidates: list[tuple[int, np.ndarray]] = []  # (orig_idx, pil_img_tensor)
+    
+    for idx, m in enumerate(masks_input):
+        geom = _extract_mask_geometry(m)
+        if geom is None:
+            scores[idx] = -1.0
+            continue
+        
+        iy0, iy1, ix0, ix1, ly0, ly1, lx0, lx1, h, w, area_ratio, bbox_fill, full_h, full_w = geom
+        
+        # Area filtering
+        if area_ratio < min_area or area_ratio > max_area:
+            scores[idx] = -1.0
+            continue
+        
+        # Prepare crop
+        tile_seg = m["segmentation"]
+        crop = img_model[iy0:iy1, ix0:ix1]
+        crop_mask = tile_seg[ly0:ly1, lx0:lx1][..., None]
+        object_only = np.where(crop_mask, crop, 255).astype(np.uint8)
+        pil_img = Image.fromarray(object_only)
+        img_tensor = clip_preprocess(pil_img)
+        
+        candidates.append((idx, img_tensor, iy0, iy1, ix0, ix1, ly0, ly1, lx0, lx1, h, w, area_ratio, bbox_fill, tile_seg, full_h, full_w, m))
+    
+    if not candidates:
+        return scores
+    
+    # Batch CLIP encoding
+    batch_indices = [c[0] for c in candidates]
+    batch_tensors = torch.stack([c[1] for c in candidates]).to(clip_device)
+    
+    with torch.no_grad():
+        batch_features = clip_model.encode_image(batch_tensors)
+        batch_features = batch_features / batch_features.norm(dim=-1, keepdim=True)
+    
+    # Unbatch results and compute scores
+    neg_weight = float(prompt_config.get("clip_negative_weight", 0.35))
+    
+    for batch_idx, (orig_idx, _, iy0, iy1, ix0, ix1, ly0, ly1, lx0, lx1, h, w, area_ratio, bbox_fill, tile_seg, full_h, full_w, m) in enumerate(candidates):
+        image_features = batch_features[batch_idx:batch_idx+1]
+        
+        # CLIP scores
+        pos_sim = float((image_features @ pos_text_feature.T).item())
+        score = pos_sim
+        
+        if neg_text_feature is not None:
+            neg_sim = float((image_features @ neg_text_feature.T).item())
+            score -= neg_weight * max(0.0, neg_sim)
+        
+        # Geometry bonuses
+        iou = float(m.get("predicted_iou", 0.0))
+        stability = float(m.get("stability_score", 0.0))
+        score += 0.05 * iou + 0.05 * stability 
+        
+        aspect = max(h, w) / float(min(h, w))
+        elongation_score = np.clip((aspect - 1.5) / 6.0, 0.0, 1.0)
+        sparse_fill_score = np.clip((0.65 - bbox_fill) / 0.65, 0.0, 1.0)
+        score += 0.12 * float(elongation_score)
+        score += 0.06 * float(sparse_fill_score)
+        
+        # Color bonuses
+        mask_pixels = img_model[iy0:iy1, ix0:ix1][tile_seg[ly0:ly1, lx0:lx1]]
+        if mask_pixels.size > 0:
+            pixels_norm = mask_pixels.astype(np.float32) / 255.0
+            hsv = rgb_to_hsv(pixels_norm.reshape(-1, 1, 3)).reshape(-1, 3)
+            sat = float(hsv[:, 1].mean())
+            val = float(hsv[:, 2].mean())
+            
+            max_sat = prompt_config.get("max_saturation", 0.28)
+            min_val = prompt_config.get("min_value", 0.35)
+            
+            low_sat_score = np.clip((max_sat - sat) / max_sat, 0.0, 1.0)
+            bright_enough_score = np.clip((val - min_val) / (1.0 - min_val), 0.0, 1.0)
+            
+            score += 0.05 * float(low_sat_score)
+            score += 0.04 * float(bright_enough_score)
+        
+        scores[orig_idx] = score
+    
+    return scores
+
+
+def serial_score_masks_clip(
+    masks_input: list,
+    pos_text_feature: torch.Tensor,
+    neg_text_feature: torch.Tensor | None,
+    prompt_config: dict,
+) -> list[float]:
+    """Fallback CLIP scorer that processes one mask at a time."""
+    scores: list[float] = []
+    for mask_dict in masks_input:
+        try:
+            scores.append(score_mask(mask_dict, pos_text_feature, neg_text_feature, prompt_config))
+        except Exception as exc:
+            print(f"[ERROR] Serial CLIP scoring failed for one mask: {exc}")
+            import traceback
+            traceback.print_exc()
+            scores.append(-1.0)
+    return scores
 
 
 def select_masks_for_prompt(
@@ -541,15 +1168,28 @@ def select_masks_for_prompt(
     stage_start = perf_counter()
     print(f"[INFO] Scoring {len(masks_input)} masks for '{prompt_name}'")
 
-    for idx, m in enumerate(masks_input, start=1):
-        m[score_key] = score_mask(m, pos_text_feature, neg_text_feature, prompt_config)
-        if idx == 1 or idx % 25 == 0 or idx == len(masks_input):
-            elapsed = perf_counter() - stage_start
-            rate = idx / max(elapsed, 1e-6)
-            eta = (len(masks_input) - idx) / max(rate, 1e-6)
+    # Use batch CLIP scoring for ~2-4x speedup, but fall back to serial scoring if needed.
+    try:
+        scores = batch_score_masks_clip(masks_input, pos_text_feature, neg_text_feature, prompt_config)
+    except Exception as exc:
+        print(f"[ERROR] Batch CLIP scoring failed for '{prompt_name}': {exc}")
+        import traceback
+        traceback.print_exc()
+        print(f"[INFO] Retrying CLIP scoring serially for '{prompt_name}'")
+        try:
+            scores = serial_score_masks_clip(masks_input, pos_text_feature, neg_text_feature, prompt_config)
+        except Exception as retry_exc:
+            print(f"[ERROR] Serial CLIP scoring also failed for '{prompt_name}': {retry_exc}")
+            import traceback
+            traceback.print_exc()
+            print(f"[ERROR] No CLIP scoring method worked for '{prompt_name}'; skipping prompt")
+            return [], float(prompt_config.get("clip_score_threshold", -0.03))
+    
+    for idx, score in enumerate(scores):
+        masks_input[idx][score_key] = score
+        if (idx + 1) == 1 or (idx + 1) % 50 == 0 or (idx + 1) == len(masks_input):
             print(
-                f"[PROGRESS] [{prompt_name}] Scored {idx}/{len(masks_input)} masks "
-                f"({rate:.2f} masks/s, ETA {eta:.1f}s)"
+                f"[PROGRESS] [{prompt_name}] Scored {idx + 1}/{len(masks_input)} masks"
             )
 
     log_stage(f"Mask scoring complete for '{prompt_name}'", stage_start)
@@ -585,7 +1225,9 @@ def select_masks_for_prompt(
 
 
 selected_masks_by_prompt = {}
-is_auto_mask_run = all(m.get("dino_prompt_group") in (None, "auto") for m in masks)
+auto_fallback_masks = [m for m in masks if m.get("dino_prompt_group") in (None, "auto")]
+prompt_linked_masks = [m for m in masks if m.get("dino_prompt_group") not in (None, "auto")]
+is_auto_mask_run = len(prompt_linked_masks) == 0
 
 if is_auto_mask_run:
     print(
@@ -597,13 +1239,15 @@ for prompt_name, features in clip_features.items():
     if is_auto_mask_run:
         # In SAM-only mode, each prompt evaluates an independent copy of the auto-SAM pool.
         # This keeps prompt scoring isolated even though mask geometry came from one SAM run.
-        prompt_masks = [{**m, "dino_prompt_group": prompt_name} for m in masks]
+        prompt_masks = [{**m, "dino_prompt_group": prompt_name} for m in auto_fallback_masks]
         print(
             f"[INFO] Prompt '{prompt_name}' evaluating {len(prompt_masks)} independent SAM-only candidates"
         )
     else:
         # In DINO-guided mode, keep strict prompt isolation from DINO group labels.
         prompt_masks = [m for m in masks if m.get("dino_prompt_group") == prompt_name]
+        if auto_fallback_masks:
+            prompt_masks.extend({**m, "dino_prompt_group": prompt_name} for m in auto_fallback_masks)
         if not prompt_masks:
             print(
                 f"[WARN] No SAM masks linked to prompt '{prompt_name}'; selecting 0 masks for this prompt."
@@ -683,7 +1327,12 @@ viz_img = img_display[::viz_stride, ::viz_stride]
 # Colors for different prompts (explicit and high-contrast for reliable legend matching)
 prompt_colors = {
     "sports_court": [1.00, 0.84, 0.00],   # gold
+    "transit_hub": [0.95, 0.35, 0.80],    # magenta-pink
+    "pedestrian_features": [0.45, 0.95, 0.25],  # lime green
+    "sidewalk_surface": [0.00, 0.90, 0.90],  # cyan
+    "road_surface": [0.65, 0.65, 0.65],   # medium gray
     "park": [0.00, 0.65, 1.00],           # vivid blue
+    "warehouse_roof": [1.00, 0.55, 0.00], # bold orange
     "building_roof": [1.00, 0.20, 0.20],  # bold red
     "outdoor_seating": [0.10, 0.90, 0.90],
     "standing_gathering": [1.00, 0.65, 0.10],
@@ -697,6 +1346,7 @@ def get_prompt_color(prompt_name: str) -> np.ndarray:
     return np.array(prompt_colors.get(prompt_name, [1.0, 0.0, 1.0]), dtype=np.float32)
 
 # Save individual visualizations for each prompt
+log_image_stage("Building visualizations", 5, PIPELINE_STAGE_TOTAL)
 for prompt_name, combined_mask in combined_masks.items():
     viz_mask = combined_mask[::viz_stride, ::viz_stride]
     color = get_prompt_color(prompt_name)
@@ -803,4 +1453,5 @@ print(f"[INFO] Total figures saved this run: {len(saved_figure_paths)}")
 for p in saved_figure_paths:
     print(f"[INFO] -> {p}")
 
+log_image_stage("Completed", 6, PIPELINE_STAGE_TOTAL)
 log_stage("Pipeline complete", script_start)

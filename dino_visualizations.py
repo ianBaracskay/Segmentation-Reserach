@@ -58,7 +58,12 @@ def save_per_prompt_breakdown(
     prompt_colors = {
         "sidewalk": "#00FF00",
         "sitting": "#FF8800",
+        "transit_hub": "#FF55CC",
+        "pedestrian_features": "#7CFF3A",
+        "sidewalk_surface": "#00E6E6",
+        "road_surface": "#A9A9A9",
         "building_roof": "#00FF00",
+        "warehouse_roof": "#FF8C00",
         "outdoor_seating": "#00FF00",
         "seated_dining": "#FF8800",
         "standing_gathering": "#00FFFF",
