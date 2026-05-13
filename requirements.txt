@@ -1,0 +1,8 @@
+numpy
+rasterio
+matplotlib
+pyproj
+contextily
+scikit-learn
+scikit-image
+opencv-contrib-python

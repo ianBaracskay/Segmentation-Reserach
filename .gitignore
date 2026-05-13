@@ -4,3 +4,4 @@ planet.local.json
 *.pth
 /Results
 /__pycache__
+/Maps

@@ -6,6 +6,87 @@ Add new prompts here as you discover them.
 
 # All available prompt definitions
 AVAILABLE_PROMPTS = {
+    "sitting_area": {
+        # Proxy label for areas likely suitable for sitting or lingering.
+        "caption": "plaza . courtyard . outdoor seating . patio . bench . picnic table . park . tree-lined lawn . public square",
+        "negative_dino_caption": "building . roof . parking lot . road . car . highway . construction site . empty field",
+        "negative_box_threshold": 0.34,
+        "negative_text_threshold": 0.30,
+        "box_threshold": 0.24,
+        "text_threshold": 0.20,
+        "keywords": ("plaza", "courtyard", "seating", "bench", "table", "patio", "park", "square"),
+        "negative_keywords": ("building", "roof", "parking", "road", "car", "highway", "construction"),
+        "min_aspect_ratio": 0.6,
+        "max_aspect_ratio": 12.0,
+        "min_box_side_px": 24,
+        "max_split_boxes_per_detection": 96,
+        "enable_area_split": False,
+        "enable_tiled_fallback": True,
+        "max_area_meters_sq": 120000,
+        "negative_captions": ["building roof", "parking lot", "road", "highway"],
+        "clip_negative_weight": 0.40,
+        "clip_top_k": 50,
+        "clip_score_threshold": 0.02,
+        "clip_relative_score_margin": 0.10,
+        "clip_min_area_ratio": 0.0002,
+        "clip_max_area_ratio": 0.60,
+        "max_saturation": 1.0,
+        "min_value": 0.18,
+    },
+    "walking_area": {
+        # Proxy label for walkable pedestrian corridors and sidewalks.
+        "caption": "sidewalk . pedestrian walkway . footpath . paved walkway . pedestrian path . trail . promenade",
+        "negative_dino_caption": "building . roof . parking lot . road . highway . car . construction site . empty field",
+        "negative_box_threshold": 0.34,
+        "negative_text_threshold": 0.28,
+        "box_threshold": 0.18,
+        "text_threshold": 0.14,
+        "keywords": ("sidewalk", "walkway", "footpath", "path", "trail", "promenade", "pedestrian"),
+        "negative_keywords": ("building", "roof", "parking", "road", "car", "highway", "construction"),
+        "min_aspect_ratio": 0.4,
+        "max_aspect_ratio": 24.0,
+        "min_box_side_px": 18,
+        "max_split_boxes_per_detection": 96,
+        "enable_area_split": False,
+        "enable_tiled_fallback": True,
+        "max_area_meters_sq": 150000,
+        "negative_captions": ["building roof", "parking lot", "road lane", "highway"],
+        "clip_negative_weight": 0.42,
+        "clip_top_k": 50,
+        "clip_score_threshold": 0.0,
+        "clip_relative_score_margin": 0.10,
+        "clip_min_area_ratio": 0.00015,
+        "clip_max_area_ratio": 0.65,
+        "max_saturation": 1.0,
+        "min_value": 0.18,
+    },
+    "uncomfortable_area": {
+        # Proxy label for exposed, hardscape-heavy, lower-comfort areas.
+        "caption": "road . parking lot . asphalt . concrete plaza . exposed hardscape . highway . vacant lot . building roof",
+        "negative_dino_caption": "park . tree canopy . grass lawn . outdoor seating . plaza . courtyard",
+        "negative_box_threshold": 0.34,
+        "negative_text_threshold": 0.30,
+        "box_threshold": 0.18,
+        "text_threshold": 0.14,
+        "keywords": ("road", "parking", "asphalt", "concrete", "hardscape", "highway", "vacant", "roof"),
+        "negative_keywords": ("park", "tree", "grass", "seating", "plaza", "courtyard"),
+        "min_aspect_ratio": 0.35,
+        "max_aspect_ratio": 30.0,
+        "min_box_side_px": 20,
+        "max_split_boxes_per_detection": 128,
+        "enable_area_split": False,
+        "enable_tiled_fallback": True,
+        "max_area_meters_sq": 250000,
+        "negative_captions": ["park", "tree canopy", "grass lawn", "outdoor seating"],
+        "clip_negative_weight": 0.45,
+        "clip_top_k": 60,
+        "clip_score_threshold": -0.02,
+        "clip_relative_score_margin": 0.12,
+        "clip_min_area_ratio": 0.0002,
+        "clip_max_area_ratio": 0.85,
+        "max_saturation": 1.0,
+        "min_value": 0.12,
+    },
     "sports_court": {
         # Sports courts and athletic areas - HIGHEST PRIORITY (most specific, very reliable)
         "caption": "basketball court . tennis court . sports court . hard court . fenced court",
@@ -35,44 +116,41 @@ AVAILABLE_PROMPTS = {
         "max_saturation": 1.0,
         "min_value": 0.20,
     },
-    "outdoor_seating": {
-        # Broad but intentional gathering-area detector
-        "caption": "outdoor seating . patio . terrace . plaza . courtyard . bench . picnic table . outdoor dining area . pedestrian area . sidewalk seating",
+    "gathering_space": {
+        # Combined detector for outdoor gathering areas: both seated (outdoor_seating) and standing (plaza/courtyard)
+        # Detects plazas, courtyards, patios, terraces, and open social gathering areas
+        "caption": "plaza . courtyard . outdoor gathering area . public square . terrace . outdoor seating . patio . bench . picnic table . pedestrian area . open congregation area",
         "negative_dino_caption": "building . roof . parking lot . road . car . highway . construction site . grass field . empty field",
         "negative_box_threshold": 0.34,
         "negative_text_threshold": 0.30,
-        # DINO detection settings
-        "box_threshold": 0.30,
-        "text_threshold": 0.26,
-        "keywords": ("bench", "table", "seating", "patio", "plaza", "courtyard", "dining"),
+        # DINO detection settings - tuned to catch both seated and standing gathering types
+        "box_threshold": 0.28,  # Slightly lower to catch both types
+        "text_threshold": 0.24,  # Slightly lower for better recall
+        "keywords": ("plaza", "courtyard", "gathering", "square", "terrace", "bench", "table", "seating", "patio", "dining", "pedestrian"),
         "negative_keywords": ("building", "roof", "parking", "road", "car", "highway", "construction", "grass", "field"),
-        "min_aspect_ratio": 0.8,
-        "max_aspect_ratio": 8.0,  # Gathering areas are more rectangular, not elongated
-        "min_box_side_px": 25,
-        "max_split_boxes_per_detection": 64,
+        "min_aspect_ratio": 0.7,  # Can be varied aspect ratios (squares or rectangles)
+        "max_aspect_ratio": 9.0,  # Gathering areas can be somewhat elongated
+        "min_box_side_px": 25,  # Gathering spaces are substantial
+        "max_split_boxes_per_detection": 72,
         "enable_area_split": False,
         "enable_tiled_fallback": True,
-        "max_area_meters_sq": 50000,  # Courtyards/plazas can be large
+        "max_area_meters_sq": 60000,  # Courtyards/plazas can be large
         "negative_captions": [
-            "building",
-            "roof",
+            "building roof",
             "parking lot",
-            "road",
-            "car",
-            "highway",
-            "construction site",
-            "grass field",
-            "empty field",
+            "sports field",
+            "tree canopy",
+            "grass lawn",
         ],
-        "clip_negative_weight": 0.45,  # Strong rejection of empty/barren areas
+        "clip_negative_weight": 0.43,  # Strong rejection of empty/barren areas
         # SAM/CLIP evaluation settings
         "clip_top_k": 50,
-        "clip_score_threshold": 0.05,  # Gathering areas should have positive signals
-        "clip_relative_score_margin": 0.15,
-        "clip_min_area_ratio": 0.0002,
-        "clip_max_area_ratio": 0.40,
-        "max_saturation": 1.0,  # Varied saturation (furniture, people have colors)
-        "min_value": 0.25,  # Can be in partial shade
+        "clip_score_threshold": 0.03,  # Moderate threshold for gathering areas
+        "clip_relative_score_margin": 0.14,
+        "clip_min_area_ratio": 0.0003,
+        "clip_max_area_ratio": 0.45,
+        "max_saturation": 1.0,  # Varied saturation (furniture, people, pavement)
+        "min_value": 0.22,  # Can be in partial shade
     },
     "seated_dining": {
         # Actual prompts given to DINO/SAM - specific to outdoor restaurants/cafes

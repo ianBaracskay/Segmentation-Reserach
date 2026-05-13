@@ -1,4 +1,5 @@
 from datetime import datetime
+import faulthandler
 import os
 from pathlib import Path
 import subprocess
@@ -19,6 +20,8 @@ from PIL import Image
 from segment_anything import SamPredictor, sam_model_registry
 
 import config as cfg
+
+faulthandler.enable(all_threads=True)
 
 # Optional, targeted suppression for known low-risk third-party warnings.
 if getattr(cfg, "dino_suppress_low_risk_warnings", False):
@@ -286,6 +289,10 @@ def save_dino_cache(image_path: str, image_hash: str, dino_records: list | None,
         return False
     if dino_records is None:
         return False
+    cache_empty_dino = bool(getattr(cfg, "cache_empty_dino_results", False))
+    if len(dino_records) == 0 and not cache_empty_dino:
+        print("[INFO] Skipping DINO cache write for empty result set")
+        return False
     
     try:
         cache_dir = get_cache_dir()
@@ -314,8 +321,13 @@ def load_dino_cache(image_path: str, image_hash: str, file_context: str) -> list
         
         with open(cache_file, "rb") as f:
             data = pickle.load(f)
+        cached_records = data.get("dino_records")
+        cache_empty_dino = bool(getattr(cfg, "cache_empty_dino_results", False))
+        if isinstance(cached_records, list) and len(cached_records) == 0 and not cache_empty_dino:
+            print(f"[INFO] Ignoring empty DINO cache entry: {cache_file.name}")
+            return None
         print(f"[INFO] Loaded DINO from cache: {cache_file.name}")
-        return data.get("dino_records")
+        return cached_records
     except Exception as e:
         print(f"[WARN] Failed to load DINO cache: {e}")
         return None

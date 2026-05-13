@@ -2,6 +2,7 @@ from pathlib import Path
 
 # Input image settings
 tif_files = [
+    "Maps/Tiles/Atlanta_split/tile_000_000.tif",
     "Maps/NYC/NYC(small).tif",
     "Maps/GTCampus/CampusFullSize.tif",
     "Maps/Grove(LA)/The Grove.tif"
@@ -9,8 +10,8 @@ tif_files = [
 ]
 # Use "all" to run every file in tif_files, or "single" to run just one selection.
 tif_run_mode = "single"  # "all" or "single"
-tif_single_index = 1  # 0-based index into tif_files when tif_run_mode="single"
-tif_single_file = None  # Optional explicit single file path override when tif_run_mode="single"
+tif_single_index = 2  # 0-based index into tif_files when tif_run_mode="single"
+tif_single_file = "Maps/GTCampus/CampusFullSize.tif"  # Optional explicit single file path override when tif_run_mode="single"
 tif_file = tif_files[tif_single_index]  # Backward compatibility for modules still reading cfg.tif_file
 use_bbox_crop = False
 bbox_lonlat = (-84.4010, 33.7720, -84.3950, 33.7760)
@@ -28,16 +29,16 @@ amenity_heatmap_taper_sigma_cells = 0.90
 amenity_heatmap_taper_blend = 0.75
 dino_heatmap_mode = "average"  # "average" or "sum" - average shows per-pixel detection confidence, sum shows detection density
 dino_enable_diagnostic_visualizations = True
-dino_diagnostic_max_pixels = 120_000_000  # Skip heavy DINO diagnostics above this image size
+dino_diagnostic_max_pixels = 500_000_000  # Skip heavy DINO diagnostics above this image size
 
 # Large-image tiled pipeline settings
-large_image_tile_max_pixels = 120_000_000  # Switch to tiled DINO+SAM processing above this size
+large_image_tile_max_pixels = 250_000_000  # Switch to tiled DINO+SAM processing above this size
 large_image_tile_size_px = 4096
 large_image_tile_overlap_px = 384
 
 # Caching settings - saves DINO and SAM results to disk to avoid re-computation on error recovery
 enable_pipeline_caching = True  # Set to True to cache DINO/SAM intermediate results between runs
-overwrite_pipeline_cache = False  # Set to True to force re-compute and overwrite existing cache
+overwrite_pipeline_cache = True  # Keep False for long runs so completed tiles are reused after interruptions
 
 # DINO settings - Set use_dino=False to skip DINO and use SAM's automatic mask generation instead
 use_dino = True
@@ -46,10 +47,11 @@ dino_suppress_low_risk_warnings = True
 dino_full_resolution = False  # If True, skip global DINO resize and run at native pixel dimensions; False uses resize (faster, avoids OOM)
 dino_resize_short_side = 1200
 dino_resize_max_size = 2000
-dino_device = "cuda"  # "auto", "cpu", "cuda"
+dino_device = "auto"  # "auto", "cpu", "cuda"
+cache_empty_dino_results = False  # Keep False to avoid reusing empty DINO caches from failed runs
 dino_enable_tiled_fallback = True
-dino_tile_size_px = 6000
-dino_tile_overlap_px = 600
+dino_tile_size_px = 4096
+dino_tile_overlap_px = 384
 #dino_tiled_max_detections_per_prompt = 24
 dino_enable_area_split = False  # Keep original DINO boxes; do not subdivide into smaller boxes
 dino_validate_split_boxes = False
@@ -57,7 +59,7 @@ dino_validate_split_max_candidates = 120
 dino_nms_iou_threshold = 0.55
 dino_negative_overlap_iou_threshold = 0.35
 dino_max_boxes_per_prompt_for_sam = 200
-dino_refine_bounds = True  # Tighten boxes by rerunning DINO inside candidate boxes
+dino_refine_bounds = False  # Disable extra per-box DINO passes to reduce runtime and memory spikes
 dino_refine_bounds_max_depth = 1  # Keep refinement shallow to avoid excessive compute
 dino_refine_bounds_min_area_ratio = 0.80  # Accept refinements only when they shrink meaningfully
 
@@ -66,16 +68,9 @@ dino_refine_bounds_min_area_ratio = 0.80  # Accept refinements only when they sh
 from prompts import AVAILABLE_PROMPTS
 
 ACTIVE_PROMPTS = [
-    "sports_court",
-    "outdoor_seating",
-    "standing_gathering",
-    #"transit_hub",
-    #"pedestrian_features",
-    "sidewalk_surface",
-    "road_surface",
-    "park",
-    #"warehouse_roof",
-    #"building_roof",
+    "sitting_area",
+    "walking_area",
+    "uncomfortable_area",
 ]  # ORDERED: gathering-focused classes first, then broad land-use and roof classes
 
 # Auto-build dino_prompt_configs from selected prompts
@@ -102,10 +97,10 @@ sam_pred_iou_thresh = 0.88  # Prediction IoU threshold for filtering masks
 sam_stability_score_thresh = 0.95  # Stability score threshold for filtering masks
 
 # Low-memory automatic SAM fallback settings for large rasters
-sam_auto_tile_size_px = 1600
-sam_auto_tile_overlap_px = 320
-sam_auto_max_points_per_side = 24
-sam_auto_max_total_masks = 3000
+sam_auto_tile_size_px = 1200
+sam_auto_tile_overlap_px = 240
+sam_auto_max_points_per_side = 18
+sam_auto_max_total_masks = 2000
 
 # Model input conversion settings (applied when source image is not uint8)
 model_input_use_robust_uint8 = True

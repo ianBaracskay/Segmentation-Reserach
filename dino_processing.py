@@ -116,10 +116,23 @@ def build_dino_model_and_transform(config) -> tuple[object, object, str]:
 
     dino_model = load_model(str(dino_config_path), str(dino_checkpoint_path))
 
-    if config.dino_device == "auto":
-        dino_device = "cuda" if torch.cuda.is_available() else "cpu"
+    requested_device = str(getattr(config, "dino_device", "auto")).strip().lower()
+    cuda_available = bool(torch.cuda.is_available())
+    if requested_device == "auto":
+        dino_device = "cuda" if cuda_available else "cpu"
+    elif requested_device == "cuda":
+        if cuda_available:
+            dino_device = "cuda"
+        else:
+            print(
+                "[WARN] cfg.dino_device='cuda' but CUDA is unavailable in this PyTorch build; "
+                "falling back to CPU"
+            )
+            dino_device = "cpu"
     else:
-        dino_device = config.dino_device
+        dino_device = "cpu"
+
+    print(f"[INFO] DINO device resolved to '{dino_device}'")
 
     if bool(getattr(config, "dino_full_resolution", False)):
         dino_transform = T.Compose(
