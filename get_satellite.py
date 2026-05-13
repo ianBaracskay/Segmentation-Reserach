@@ -1341,6 +1341,11 @@ viz_img = img_display[::viz_stride, ::viz_stride]
 
 # Colors for different prompts (explicit and high-contrast for reliable legend matching)
 prompt_colors = {
+    # Merged NEN 8100 Wind Comfort Categories
+    "nen_cat_a": [0.00, 0.72, 0.38],   # green - comfortable, sheltered, vegetated
+    "nen_cat_c": [1.00, 0.68, 0.10],   # amber - pedestrian-accessible but uncomfortable
+    "nen_cat_e": [0.95, 0.18, 0.18],   # red - highways, roofs, no-access hardscape
+    # Legacy amenity prompts
     "sports_court": [1.00, 0.84, 0.00],   # gold
     "transit_hub": [0.95, 0.35, 0.80],    # magenta-pink
     "pedestrian_features": [0.45, 0.95, 0.25],  # lime green
@@ -1427,7 +1432,7 @@ else:
     )
     amenity_mask_union = heatmap_mask_union
 
-if loaded_extent_m is not None:
+if getattr(cfg, "build_amenity_heatmap", False) and loaded_extent_m is not None:
     stage_start = perf_counter()
     print(
         "[INFO] Building amenity heatmap grid from mask union "
@@ -1461,6 +1466,8 @@ if loaded_extent_m is not None:
     plt.axis("off")
     plt.title("Amenity Heatmap (Red = Higher Amenity Coverage)")
     save_current_figure(f"{run_id}_amenity_heatmap.png", "heatmaps")
+elif not getattr(cfg, "build_amenity_heatmap", False):
+    print("[INFO] Amenity heatmap generation disabled in config (build_amenity_heatmap=False).")
 else:
     print("[WARN] Skipping amenity heatmap because real-world extent is unavailable.")
 

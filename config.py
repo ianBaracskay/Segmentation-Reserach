@@ -23,6 +23,7 @@ dino_visualization_dpi = 100  # Lower DPI for DINO detections to reduce memory u
 dino_visualization_backend = "pil"  # "matplotlib" or "pil" - PIL is faster, smaller files, more efficient
 
 # Heatmap settings
+build_amenity_heatmap = False  # Set to True to generate amenity heatmap visualization (requires sufficient memory)
 amenity_grid_cell_area_m2 = 256.0
 amenity_heatmap_excluded_prompts = ["building_roof", "warehouse_roof"]
 amenity_heatmap_taper_sigma_cells = 0.90
@@ -38,7 +39,7 @@ large_image_tile_overlap_px = 384
 
 # Caching settings - saves DINO and SAM results to disk to avoid re-computation on error recovery
 enable_pipeline_caching = True  # Set to True to cache DINO/SAM intermediate results between runs
-overwrite_pipeline_cache = True  # Keep False for long runs so completed tiles are reused after interruptions
+overwrite_pipeline_cache = True  # Force recomputation after prompt changes so the cache is refreshed
 
 # DINO settings - Set use_dino=False to skip DINO and use SAM's automatic mask generation instead
 use_dino = True
@@ -67,11 +68,15 @@ dino_refine_bounds_min_area_ratio = 0.80  # Accept refinements only when they sh
 # Each prompt gets its own DINO run, then all detections are merged before SAM.
 from prompts import AVAILABLE_PROMPTS
 
+# NEN 8100 Wind Comfort Categories merged into three practical groups
+# A/B: comfortable, vegetated, sheltered outdoor areas
+# C/D: pedestrian-accessible but uncomfortable, exposed, and hardscape-heavy areas
+# E: highways, roofs, parking areas, and other no-access hardscape
 ACTIVE_PROMPTS = [
-    "sitting_area",
-    "walking_area",
-    "uncomfortable_area",
-]  # ORDERED: gathering-focused classes first, then broad land-use and roof classes
+    "nen_cat_a",
+    "nen_cat_c",
+    "nen_cat_e",
+]
 
 # Auto-build dino_prompt_configs from selected prompts
 dino_prompt_configs = [
